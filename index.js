@@ -166,7 +166,6 @@ async function resolveAddresses(addresses) {
 }
 
   return { resolved, unknown };
-}
 
 function calculateFare(km, minutes) {
   let fare = 80 + km * 15 + minutes * 3;
