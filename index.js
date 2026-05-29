@@ -25,81 +25,91 @@ const addressKeywords = [
   "站", "高鐵", "火車站", "轉運站",
   "夜市", "百貨", "醫院", "學校", "大學",
   "公園", "飯店", "旅館", "機場", "交流道",
-  "台中", "逢甲", "一中", "勤美", "東海",
-  "新光", "三越", "老虎城", "秋紅谷",
-  "烏日", "大里", "太平", "北屯", "西屯",
-  "南屯", "沙鹿", "清水", "梧棲"
+  "台中", "台南", "逢甲", "一中", "勤美", "東海",
+  "新光", "三越", "老虎城", "秋紅谷"
 ];
 
 function cleanText(text) {
   return text
     .replace(/[？?！!。]/g, "")
-    .replace(/多少錢|多少|幾錢|報價|試算|請問|您好|你好|謝謝|謝/g, "")
+    .replace(/價格多少錢|多少錢|多少|幾錢|報價|試算|想詢問|請問|您好|你好|謝謝|謝/g, "")
     .replace(/幫我|幫忙|麻煩|我要|想問|請幫我/g, "")
     .trim();
 }
 
 function looksLikeAddress(text) {
   if (!text) return false;
-
-  if (addressKeywords.some(k => text.includes(k))) {
-    return true;
-  }
-
-  // 支援短黑話：巴6、XC、歐塔、巨1
-  if (/^[A-Za-z0-9\u4e00-\u9fa5]{2,12}$/.test(text)) {
-    return true;
-  }
-
+  if (addressKeywords.some(k => text.includes(k))) return true;
+  if (/^[A-Za-z0-9\u4e00-\u9fa5]{2,12}$/.test(text)) return true;
   return false;
 }
 
 function parseAddresses(text) {
+  const addresses = [];
+
+  const pickup = text.match(/上車[:：]\s*(.+)/);
+  const dropoff = text.match(/下車[:：]\s*(.+)/);
+
+  if (pickup) addresses.push(cleanText(pickup[1]));
+  if (dropoff) addresses.push(cleanText(dropoff[1]));
+
+  if (addresses.length >= 2) {
+    return addresses.filter(Boolean).slice(0, 7);
+  }
+
   const normalized = text
     .replace(/➜|➡️|->|→|➡/g, "\n")
     .replace(/先到|再到|最後到|送到|載到|先去|再去|最後去/g, "\n")
     .replace(/到|去|至|往/g, "\n");
 
-  const parts = normalized
+  return normalized
     .split(/\n|，|,|、/)
     .map(s => cleanText(s))
     .filter(Boolean)
-    .filter(looksLikeAddress);
-
-  return [...new Set(parts)].slice(0, 7);
+    .filter(looksLikeAddress)
+    .slice(0, 7);
 }
 
 async function findAlias(alias) {
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from("location_aliases")
     .select("address")
     .eq("alias", alias)
     .maybeSingle();
 
-  if (error) {
-    console.error("findAlias error:", error);
-    return null;
-  }
-
   return data?.address || null;
 }
 
 async function saveAlias(alias, address) {
-  const { error } = await supabase
+  await supabase
     .from("location_aliases")
-    .upsert(
-      {
-        alias,
-        address,
-      },
-      {
-        onConflict: "alias",
-      }
-    );
+    .upsert({ alias, address }, { onConflict: "alias" });
+}
 
-  if (error) {
-    console.error("saveAlias error:", error);
-  }
+async function getPendingAlias(userId) {
+  const { data } = await supabase
+    .from("pending_aliases")
+    .select("*")
+    .eq("user_id", userId)
+    .order("created_at", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+
+  return data || null;
+}
+
+async function savePendingAlias(userId, alias, originalText) {
+  await supabase.from("pending_aliases").delete().eq("user_id", userId);
+
+  await supabase.from("pending_aliases").insert({
+    user_id: userId,
+    alias,
+    original_text: originalText,
+  });
+}
+
+async function clearPendingAlias(userId) {
+  await supabase.from("pending_aliases").delete().eq("user_id", userId);
 }
 
 async function geocodeAddress(input) {
@@ -115,10 +125,7 @@ async function geocodeAddress(input) {
     }
   );
 
-  if (data.status !== "OK" || !data.results || data.results.length === 0) {
-    console.log("geocode failed:", input, data.status);
-    return null;
-  }
+  if (data.status !== "OK" || !data.results?.length) return null;
 
   return data.results[0].formatted_address;
 }
@@ -145,19 +152,13 @@ async function resolveAddresses(addresses) {
     }
   }
 
-  return {
-    resolved,
-    unknown,
-  };
+  return { resolved, unknown };
 }
 
 function calculateFare(km, minutes) {
   let fare = 80 + km * 15 + minutes * 3;
 
-  if (km > 20) {
-    fare += (km - 20) * 10;
-  }
-
+  if (km > 20) fare += (km - 20) * 10;
   if (fare < 100) fare = 100;
 
   return Math.ceil(fare);
@@ -191,7 +192,6 @@ async function getRouteFare(addresses, avoidHighways = false) {
   );
 
   if (data.status !== "OK") {
-    console.error("Directions error:", data);
     throw new Error(`Google Directions error: ${data.status}`);
   }
 
@@ -207,7 +207,6 @@ async function getRouteFare(addresses, avoidHighways = false) {
 
   const km = totalMeters / 1000;
   const minutes = totalSeconds / 60;
-  const fare = calculateFare(km, minutes);
 
   let orderedAddresses = addresses;
 
@@ -219,7 +218,7 @@ async function getRouteFare(addresses, avoidHighways = false) {
   return {
     km,
     minutes,
-    fare,
+    fare: calculateFare(km, minutes),
     orderedAddresses,
   };
 }
@@ -230,13 +229,9 @@ function formatRoute(addresses) {
   let text = "\n\n建議路線：\n";
 
   addresses.forEach((addr, index) => {
-    if (index === 0) {
-      text += `起點：${addr}\n`;
-    } else if (index === addresses.length - 1) {
-      text += `終點：${addr}\n`;
-    } else {
-      text += `停靠點${index}：${addr}\n`;
-    }
+    if (index === 0) text += `起點：${addr}\n`;
+    else if (index === addresses.length - 1) text += `終點：${addr}\n`;
+    else text += `停靠點${index}：${addr}\n`;
   });
 
   return text.trimEnd();
@@ -269,7 +264,22 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       if (event.type !== "message") continue;
       if (event.message.type !== "text") continue;
 
+      const userId = event.source.userId || event.source.groupId || "unknown";
       const text = event.message.text.trim();
+
+      const pending = await getPendingAlias(userId);
+
+      if (pending) {
+        await saveAlias(pending.alias, text);
+        await clearPendingAlias(userId);
+
+        await client.replyMessage(event.replyToken, {
+          type: "text",
+          text: `已記住\n${pending.alias} = ${text}`,
+        });
+        continue;
+      }
+
       const addresses = parseAddresses(text);
 
       if (addresses.length < 2) {
@@ -291,9 +301,11 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const { resolved, unknown } = await resolveAddresses(addresses);
 
       if (unknown.length > 0) {
+        await savePendingAlias(userId, unknown[0], text);
+
         await client.replyMessage(event.replyToken, {
           type: "text",
-          text: `無法辨識地址：${unknown.join("、")}\n請輸入更完整的地點`,
+          text: `找不到黑話【${unknown[0]}】\n請直接回覆它的完整地址`,
         });
         continue;
       }
