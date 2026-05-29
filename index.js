@@ -32,27 +32,33 @@ const addressKeywords = [
 function cleanText(text) {
   return text
     .replace(/[？?！!。]/g, "")
+    .replace(/上車[:：]/g, "")
+    .replace(/下車[:：]/g, "")
     .replace(/價格多少錢|多少錢|多少|幾錢|報價|試算|想詢問|請問|您好|你好|謝謝|謝/g, "")
     .replace(/幫我|幫忙|麻煩|我要|想問|請幫我/g, "")
     .trim();
-}
-
-function looksLikeAddress(text) {
-  if (!text) return false;
-  if (addressKeywords.some(k => text.includes(k))) return true;
-  if (/^[A-Za-z0-9\u4e00-\u9fa5]{2,12}$/.test(text)) return true;
-  return false;
 }
 
 function isShortAlias(text) {
   return /^[A-Za-z0-9\u4e00-\u9fa5]{2,8}$/.test(text);
 }
 
+function hasAddressKeyword(text) {
+  return addressKeywords.some(k => text.includes(k));
+}
+
+function looksLikeAddress(text) {
+  if (!text) return false;
+  if (hasAddressKeyword(text)) return true;
+  if (isShortAlias(text)) return true;
+  return false;
+}
+
 function parseAddresses(text) {
   const addresses = [];
 
-  const pickup = text.match(/上車[:：]\s*(.+)/);
-  const dropoff = text.match(/下車[:：]\s*(.+)/);
+  const pickup = text.match(/上車[:：]\s*([^\n\r]+)/);
+  const dropoff = text.match(/下車[:：]\s*([^\n\r]+)/);
 
   if (pickup) addresses.push(cleanText(pickup[1]));
   if (dropoff) addresses.push(cleanText(dropoff[1]));
@@ -75,23 +81,33 @@ function parseAddresses(text) {
 }
 
 async function findAlias(alias) {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("location_aliases")
     .select("address")
     .eq("alias", alias)
     .maybeSingle();
 
+  if (error) {
+    console.error("findAlias error:", error);
+    return null;
+  }
+
   return data?.address || null;
 }
 
 async function saveAlias(alias, address) {
-  await supabase
+  const { error } = await supabase
     .from("location_aliases")
     .upsert({ alias, address }, { onConflict: "alias" });
+
+  if (error) {
+    console.error("saveAlias error:", error);
+    throw error;
+  }
 }
 
 async function getPendingAlias(userId) {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from("pending_aliases")
     .select("*")
     .eq("user_id", userId)
@@ -99,21 +115,38 @@ async function getPendingAlias(userId) {
     .limit(1)
     .maybeSingle();
 
+  if (error) {
+    console.error("getPendingAlias error:", error);
+    return null;
+  }
+
   return data || null;
 }
 
 async function savePendingAlias(userId, alias, originalText) {
   await supabase.from("pending_aliases").delete().eq("user_id", userId);
 
-  await supabase.from("pending_aliases").insert({
+  const { error } = await supabase.from("pending_aliases").insert({
     user_id: userId,
     alias,
     original_text: originalText,
   });
+
+  if (error) {
+    console.error("savePendingAlias error:", error);
+    throw error;
+  }
 }
 
 async function clearPendingAlias(userId) {
-  await supabase.from("pending_aliases").delete().eq("user_id", userId);
+  const { error } = await supabase
+    .from("pending_aliases")
+    .delete()
+    .eq("user_id", userId);
+
+  if (error) {
+    console.error("clearPendingAlias error:", error);
+  }
 }
 
 async function geocodeAddress(input) {
@@ -146,7 +179,8 @@ async function resolveAddresses(addresses) {
       continue;
     }
 
-    if (isShortAlias(item) && !addressKeywords.some(k => item.includes(k))) {
+    // 重點：巴六、xc、歐塔、巨1 這種短黑話，查不到就直接問，不丟 Google
+    if (isShortAlias(item) && !hasAddressKeyword(item)) {
       unknown.push(item);
       continue;
     }
@@ -167,10 +201,7 @@ async function resolveAddresses(addresses) {
 function calculateFare(km, minutes) {
   let fare = 80 + km * 15 + minutes * 3;
 
-  if (km > 20) {
-    fare += (km - 20) * 10;
-  }
-
+  if (km > 20) fare += (km - 20) * 10;
   if (fare < 100) fare = 100;
 
   return Math.ceil(fare);
@@ -280,6 +311,8 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const userId = event.source.userId || event.source.groupId || "unknown";
       const text = event.message.text.trim();
 
+      console.log("USER TEXT:", text);
+
       const pending = await getPendingAlias(userId);
 
       if (pending) {
@@ -294,6 +327,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
 
       const addresses = parseAddresses(text);
+      console.log("PARSED ADDRESSES:", addresses);
 
       if (addresses.length < 2) {
         await client.replyMessage(event.replyToken, {
@@ -304,6 +338,9 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       }
 
       const { resolved, unknown } = await resolveAddresses(addresses);
+
+      console.log("RESOLVED:", resolved);
+      console.log("UNKNOWN:", unknown);
 
       if (unknown.length > 0) {
         await savePendingAlias(userId, unknown[0], text);
