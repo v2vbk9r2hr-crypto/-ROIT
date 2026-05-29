@@ -24,9 +24,11 @@ const addressKeywords = [
   "區", "市", "縣", "鎮", "鄉",
   "站", "高鐵", "火車站", "轉運站",
   "夜市", "百貨", "醫院", "學校", "大學",
-  "公園", "飯店", "旅館", "機場", "交流道",
+  "公園", "飯店", "旅館", "酒店", "汽旅", "商旅",
+  "機場", "交流道", "醫美", "診所", "醫院",
+  "宮", "廟", "寺", "壇", "祠", "堂",
   "台中", "台南", "逢甲", "一中", "勤美", "東海",
-  "新光", "三越", "老虎城", "秋紅谷"
+  "新光", "三越", "老虎城", "秋紅谷", "鎮瀾宮", "林酒店"
 ];
 
 function cleanText(text) {
@@ -39,18 +41,14 @@ function cleanText(text) {
     .trim();
 }
 
-function isShortAlias(text) {
-  return /^[A-Za-z0-9\u4e00-\u9fa5]{2,8}$/.test(text);
-}
-
-function hasAddressKeyword(text) {
-  return addressKeywords.some(k => text.includes(k));
+function isShortEnglishAlias(text) {
+  return /^[A-Za-z0-9]{1,8}$/.test(text);
 }
 
 function looksLikeAddress(text) {
   if (!text) return false;
-  if (hasAddressKeyword(text)) return true;
-  if (isShortAlias(text)) return true;
+  if (addressKeywords.some(k => text.includes(k))) return true;
+  if (/^[A-Za-z0-9\u4e00-\u9fa5]{2,20}$/.test(text)) return true;
   return false;
 }
 
@@ -81,33 +79,23 @@ function parseAddresses(text) {
 }
 
 async function findAlias(alias) {
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from("location_aliases")
     .select("address")
     .eq("alias", alias)
     .maybeSingle();
 
-  if (error) {
-    console.error("findAlias error:", error);
-    return null;
-  }
-
   return data?.address || null;
 }
 
 async function saveAlias(alias, address) {
-  const { error } = await supabase
+  await supabase
     .from("location_aliases")
     .upsert({ alias, address }, { onConflict: "alias" });
-
-  if (error) {
-    console.error("saveAlias error:", error);
-    throw error;
-  }
 }
 
 async function getPendingAlias(userId) {
-  const { data, error } = await supabase
+  const { data } = await supabase
     .from("pending_aliases")
     .select("*")
     .eq("user_id", userId)
@@ -115,38 +103,43 @@ async function getPendingAlias(userId) {
     .limit(1)
     .maybeSingle();
 
-  if (error) {
-    console.error("getPendingAlias error:", error);
-    return null;
-  }
-
   return data || null;
 }
 
 async function savePendingAlias(userId, alias, originalText) {
   await supabase.from("pending_aliases").delete().eq("user_id", userId);
 
-  const { error } = await supabase.from("pending_aliases").insert({
+  await supabase.from("pending_aliases").insert({
     user_id: userId,
     alias,
     original_text: originalText,
   });
-
-  if (error) {
-    console.error("savePendingAlias error:", error);
-    throw error;
-  }
 }
 
 async function clearPendingAlias(userId) {
-  const { error } = await supabase
-    .from("pending_aliases")
-    .delete()
-    .eq("user_id", userId);
+  await supabase.from("pending_aliases").delete().eq("user_id", userId);
+}
 
-  if (error) {
-    console.error("clearPendingAlias error:", error);
+async function searchPlace(input) {
+  const { data } = await axios.get(
+    "https://maps.googleapis.com/maps/api/place/textsearch/json",
+    {
+      params: {
+        query: `${input} 台灣`,
+        language: "zh-TW",
+        region: "tw",
+        key: process.env.GOOGLE_MAPS_API_KEY,
+      },
+    }
+  );
+
+  if (data.status !== "OK" || !data.results?.length) {
+    return null;
   }
+
+  const place = data.results[0];
+
+  return place.formatted_address || place.name || null;
 }
 
 async function geocodeAddress(input) {
@@ -162,9 +155,34 @@ async function geocodeAddress(input) {
     }
   );
 
-  if (data.status !== "OK" || !data.results?.length) return null;
+  if (data.status !== "OK" || !data.results?.length) {
+    return null;
+  }
 
   return data.results[0].formatted_address;
+}
+
+async function smartResolve(input) {
+  const saved = await findAlias(input);
+  if (saved) return saved;
+
+  if (isShortEnglishAlias(input)) {
+    return null;
+  }
+
+  const placeAddress = await searchPlace(input);
+  if (placeAddress) {
+    await saveAlias(input, placeAddress);
+    return placeAddress;
+  }
+
+  const geoAddress = await geocodeAddress(input);
+  if (geoAddress) {
+    await saveAlias(input, geoAddress);
+    return geoAddress;
+  }
+
+  return null;
 }
 
 async function resolveAddresses(addresses) {
@@ -172,24 +190,10 @@ async function resolveAddresses(addresses) {
   const unknown = [];
 
   for (const item of addresses) {
-    const saved = await findAlias(item);
+    const result = await smartResolve(item);
 
-    if (saved) {
-      resolved.push(saved);
-      continue;
-    }
-
-    // 重點：巴六、xc、歐塔、巨1 這種短黑話，查不到就直接問，不丟 Google
-    if (isShortAlias(item) && !hasAddressKeyword(item)) {
-      unknown.push(item);
-      continue;
-    }
-
-    const googleAddress = await geocodeAddress(item);
-
-    if (googleAddress) {
-      await saveAlias(item, googleAddress);
-      resolved.push(googleAddress);
+    if (result) {
+      resolved.push(result);
     } else {
       unknown.push(item);
     }
@@ -311,23 +315,26 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       const userId = event.source.userId || event.source.groupId || "unknown";
       const text = event.message.text.trim();
 
-      console.log("USER TEXT:", text);
-
       const pending = await getPendingAlias(userId);
 
       if (pending) {
-        await saveAlias(pending.alias, text);
+        const savedAddress =
+          (await searchPlace(text)) ||
+          (await geocodeAddress(text)) ||
+          text;
+
+        await saveAlias(pending.alias, savedAddress);
         await clearPendingAlias(userId);
 
         await client.replyMessage(event.replyToken, {
           type: "text",
-          text: `已記住\n${pending.alias} = ${text}`,
+          text: `已記住\n${pending.alias} = ${savedAddress}`,
         });
+
         continue;
       }
 
       const addresses = parseAddresses(text);
-      console.log("PARSED ADDRESSES:", addresses);
 
       if (addresses.length < 2) {
         await client.replyMessage(event.replyToken, {
@@ -339,16 +346,14 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       const { resolved, unknown } = await resolveAddresses(addresses);
 
-      console.log("RESOLVED:", resolved);
-      console.log("UNKNOWN:", unknown);
-
       if (unknown.length > 0) {
         await savePendingAlias(userId, unknown[0], text);
 
         await client.replyMessage(event.replyToken, {
           type: "text",
-          text: `找不到黑話【${unknown[0]}】\n請直接回覆它的完整地址`,
+          text: `找不到地點【${unknown[0]}】\n請直接回覆它的完整地址`,
         });
+
         continue;
       }
 
@@ -365,7 +370,7 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
       try {
         await client.replyMessage(event.replyToken, {
           type: "text",
-          text: "無法試算，請確認地址是否完整",
+          text: "無法試算，請確認地址或地點名稱是否完整",
         });
       } catch (replyErr) {
         console.error("reply error:", replyErr);
