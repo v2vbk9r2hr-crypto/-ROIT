@@ -130,6 +130,10 @@ async function geocodeAddress(input) {
   return data.results[0].formatted_address;
 }
 
+function isShortAlias(text) {
+  return /^[A-Za-z0-9\u4e00-\u9fa5]{2,8}$/.test(text);
+}
+
 async function resolveAddresses(addresses) {
   const resolved = [];
   const unknown = [];
@@ -142,6 +146,12 @@ async function resolveAddresses(addresses) {
       continue;
     }
 
+    // 巴六、xc、歐塔、巨1 這種短黑話，查不到就不要丟 Google，直接問使用者
+    if (isShortAlias(item) && !addressKeywords.some(k => item.includes(k))) {
+      unknown.push(item);
+      continue;
+    }
+
     const googleAddress = await geocodeAddress(item);
 
     if (googleAddress) {
@@ -151,6 +161,9 @@ async function resolveAddresses(addresses) {
       unknown.push(item);
     }
   }
+
+  return { resolved, unknown };
+}
 
   return { resolved, unknown };
 }
