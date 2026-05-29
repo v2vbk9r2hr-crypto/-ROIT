@@ -44,6 +44,10 @@ function looksLikeAddress(text) {
   return false;
 }
 
+function isShortAlias(text) {
+  return /^[A-Za-z0-9\u4e00-\u9fa5]{2,8}$/.test(text);
+}
+
 function parseAddresses(text) {
   const addresses = [];
 
@@ -130,21 +134,11 @@ async function geocodeAddress(input) {
   return data.results[0].formatted_address;
 }
 
-function isShortAlias(text) {
-  return /^[A-Za-z0-9\u4e00-\u9fa5]{2,8}$/.test(text);
-}
-
-function isShortAlias(text) {
-  return /^[A-Za-z0-9\u4e00-\u9fa5]{2,8}$/.test(text);
-}
-
 async function resolveAddresses(addresses) {
-
   const resolved = [];
   const unknown = [];
 
   for (const item of addresses) {
-
     const saved = await findAlias(item);
 
     if (saved) {
@@ -152,10 +146,7 @@ async function resolveAddresses(addresses) {
       continue;
     }
 
-    if (
-      isShortAlias(item) &&
-      !addressKeywords.some(k => item.includes(k))
-    ) {
+    if (isShortAlias(item) && !addressKeywords.some(k => item.includes(k))) {
       unknown.push(item);
       continue;
     }
@@ -163,26 +154,85 @@ async function resolveAddresses(addresses) {
     const googleAddress = await geocodeAddress(item);
 
     if (googleAddress) {
-
-      await saveAlias(
-        item,
-        googleAddress
-      );
-
-      resolved.push(
-        googleAddress
-      );
-
+      await saveAlias(item, googleAddress);
+      resolved.push(googleAddress);
     } else {
-
       unknown.push(item);
-
     }
   }
 
+  return { resolved, unknown };
+}
+
+function calculateFare(km, minutes) {
+  let fare = 80 + km * 15 + minutes * 3;
+
+  if (km > 20) {
+    fare += (km - 20) * 10;
+  }
+
+  if (fare < 100) fare = 100;
+
+  return Math.ceil(fare);
+}
+
+async function getRouteFare(addresses, avoidHighways = false) {
+  const origin = addresses[0];
+  const destination = addresses[addresses.length - 1];
+  const middlePoints = addresses.slice(1, -1);
+
+  const params = {
+    origin,
+    destination,
+    mode: "driving",
+    language: "zh-TW",
+    region: "tw",
+    key: process.env.GOOGLE_MAPS_API_KEY,
+  };
+
+  if (middlePoints.length > 0) {
+    params.waypoints = "optimize:true|" + middlePoints.join("|");
+  }
+
+  if (avoidHighways) {
+    params.avoid = "highways";
+  }
+
+  const { data } = await axios.get(
+    "https://maps.googleapis.com/maps/api/directions/json",
+    { params }
+  );
+
+  if (data.status !== "OK") {
+    console.error("Directions error:", data);
+    throw new Error(`Google Directions error: ${data.status}`);
+  }
+
+  const route = data.routes[0];
+
+  let totalMeters = 0;
+  let totalSeconds = 0;
+
+  for (const leg of route.legs) {
+    totalMeters += leg.distance.value;
+    totalSeconds += leg.duration.value;
+  }
+
+  const km = totalMeters / 1000;
+  const minutes = totalSeconds / 60;
+
+  let orderedAddresses = addresses;
+
+  if (middlePoints.length > 0 && route.waypoint_order) {
+    const orderedMiddle = route.waypoint_order.map(i => middlePoints[i]);
+    orderedAddresses = [origin, ...orderedMiddle, destination];
+  }
+
   return {
-    resolved,
-    unknown
+    km,
+    minutes,
+    fare: calculateFare(km, minutes),
+    orderedAddresses,
   };
 }
 
@@ -249,14 +299,6 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
         await client.replyMessage(event.replyToken, {
           type: "text",
           text: "請輸入至少兩個地址",
-        });
-        continue;
-      }
-
-      if (addresses.length > 7) {
-        await client.replyMessage(event.replyToken, {
-          type: "text",
-          text: "一次最多試算7個地址",
         });
         continue;
       }
