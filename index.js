@@ -41,8 +41,18 @@ function cleanText(text) {
     .trim();
 }
 
-function isShortEnglishAlias(text) {
-  return /^[A-Za-z0-9]{1,8}$/.test(text);
+function isLikelyAlias(text) {
+  if (!text) return false;
+
+  const t = text.trim();
+
+  // 英文數字短碼：xc、A1、abc123
+  if (/^[A-Za-z0-9]{1,8}$/.test(t)) return true;
+
+  // 中文黑話：2~4字，例如 巴六、歐塔、巨蛋
+  if (/^[\u4e00-\u9fa5]{2,4}$/.test(t)) return true;
+
+  return false;
 }
 
 function looksLikeAddress(text) {
@@ -120,6 +130,41 @@ async function clearPendingAlias(userId) {
   await supabase.from("pending_aliases").delete().eq("user_id", userId);
 }
 
+async function deleteAlias(alias) {
+  await supabase
+    .from("location_aliases")
+    .delete()
+    .eq("alias", alias);
+}
+
+async function handleAliasCommand(text) {
+  const add = text.match(/^新增黑話\s+(.+?)=(.+)$/);
+  if (add) {
+    const alias = add[1].trim();
+    const address = add[2].trim();
+    await saveAlias(alias, address);
+    return `已記住\n${alias} = ${address}`;
+  }
+
+  const find = text.match(/^查黑話\s+(.+)$/);
+  if (find) {
+    const alias = find[1].trim();
+    const address = await findAlias(alias);
+    return address
+      ? `${alias} = ${address}`
+      : `查不到黑話：${alias}`;
+  }
+
+  const del = text.match(/^刪黑話\s+(.+)$/);
+  if (del) {
+    const alias = del[1].trim();
+    await deleteAlias(alias);
+    return `已刪除黑話：${alias}`;
+  }
+
+  return null;
+}
+
 async function searchPlace(input) {
   const { data } = await axios.get(
     "https://maps.googleapis.com/maps/api/place/textsearch/json",
@@ -166,9 +211,16 @@ async function smartResolve(input) {
   const saved = await findAlias(input);
   if (saved) return saved;
 
-  if (isShortEnglishAlias(input)) {
-    return null;
+if (isLikelyAlias(input)) {
+  const placeAddress = await searchPlace(input);
+
+  if (placeAddress) {
+    await saveAlias(input, placeAddress);
+    return placeAddress;
   }
+
+  return null;
+}
 
   const placeAddress = await searchPlace(input);
   if (placeAddress) {
@@ -222,6 +274,7 @@ async function getRouteFare(addresses, avoidHighways = false) {
     mode: "driving",
     language: "zh-TW",
     region: "tw",
+    alternatives: true,
     key: process.env.GOOGLE_MAPS_API_KEY,
   };
 
@@ -238,28 +291,38 @@ async function getRouteFare(addresses, avoidHighways = false) {
     { params }
   );
 
-  if (data.status !== "OK") {
+  if (data.status !== "OK" || !data.routes?.length) {
     console.error("Directions error:", data);
     throw new Error(`Google Directions error: ${data.status}`);
   }
 
-  const route = data.routes[0];
+  let bestRoute = null;
+  let bestMeters = Infinity;
+  let bestSeconds = 0;
 
-  let totalMeters = 0;
-  let totalSeconds = 0;
+  for (const route of data.routes) {
+    let totalMeters = 0;
+    let totalSeconds = 0;
 
-  for (const leg of route.legs) {
-    totalMeters += leg.distance.value;
-    totalSeconds += leg.duration.value;
+    for (const leg of route.legs) {
+      totalMeters += leg.distance.value;
+      totalSeconds += leg.duration.value;
+    }
+
+    if (totalMeters < bestMeters) {
+      bestMeters = totalMeters;
+      bestSeconds = totalSeconds;
+      bestRoute = route;
+    }
   }
 
-  const km = totalMeters / 1000;
-  const minutes = totalSeconds / 60;
+  const km = bestMeters / 1000;
+  const minutes = bestSeconds / 60;
 
   let orderedAddresses = addresses;
 
-  if (middlePoints.length > 0 && route.waypoint_order) {
-    const orderedMiddle = route.waypoint_order.map(i => middlePoints[i]);
+  if (middlePoints.length > 0 && bestRoute.waypoint_order) {
+    const orderedMiddle = bestRoute.waypoint_order.map(i => middlePoints[i]);
     orderedAddresses = [origin, ...orderedMiddle, destination];
   }
 
@@ -314,6 +377,16 @@ app.post("/webhook", line.middleware(config), async (req, res) => {
 
       const userId = event.source.userId || event.source.groupId || "unknown";
       const text = event.message.text.trim();
+
+      const aliasReply = await handleAliasCommand(text);
+
+if (aliasReply) {
+  await client.replyMessage(event.replyToken, {
+    type: "text",
+    text: aliasReply,
+  });
+  continue;
+}
 
       const pending = await getPendingAlias(userId);
 
